@@ -1,0 +1,71 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4026.12">
+  <POU Name="FB_CoverGoToPositionShellyPlus2PM" Id="{8771de05-9666-4d17-b3d5-d5f459c910d7}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK FB_CoverGoToPositionShellyPlus2PM
+VAR_INPUT
+    bSend                : BOOL;
+    nPercentage          : UINT(0..100);
+END_VAR
+VAR_IN_OUT
+    fbClient             : FB_IotHttpClient;
+END_VAR
+VAR_OUTPUT
+    bBusy                : BOOL;
+    bError               : BOOL;
+    Q 					 : BOOL; // Falling edge of bBusy
+END_VAR
+VAR
+    fbRequest            : FB_IotHttpRequest;
+    fbRisingEdgeSend     : R_TRIG;
+
+    {attribute 'TcEncoding':='UTF-8'}
+    sContent             : STRING(2047);
+    {attribute 'TcEncoding':='UTF-8'}
+    sSend                : STRING(1) := ''; // Empty; parameters are send as GET parameters in the URL
+
+    sComposedUri         : STRING(255);
+END_VAR]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[Q := FALSE;
+fbRisingEdgeSend(CLK:= bSend OR bBusy);
+
+IF NOT bBusy THEN
+	IF fbRisingEdgeSend.Q THEN
+		sSend := '';
+
+		// curl "http://<IP>/rpc/Switch.Set?id=0&on=true"
+		sComposedUri := '/rpc/';
+		sComposedUri := CONCAT(sComposedUri, 'Cover.GoToPosition?id=0&pos=');
+		sComposedUri := CONCAT(sComposedUri, UINT_TO_STRING(nPercentage));
+
+		IF fbRequest.SendRequest(
+				sUri:=sComposedUri,
+				fbClient:=fbClient,
+				eRequestType:=ETcIotHttpRequestType.HTTP_GET, 
+				pContent:=ADR(sSend),
+				nContentSize:=LEN2(ADR(sSend)),
+				0) THEN
+			bBusy:= TRUE;
+			bError:= FALSE;
+		ELSE
+			bError:=TRUE;
+			Q:= TRUE;
+		END_IF
+	END_IF
+ELSE
+    IF NOT fbRequest.bBusy THEN
+		bError:= TRUE;
+		IF NOT fbRequest.bError THEN                 
+			IF fbRequest.GetContent(pContent:= ADR(sContent), nContentSize:= SIZEOF(sContent), bSetNullTermination:= TRUE) THEN
+				IF fbRequest.nStatusCode >= 200 AND fbRequest.nStatusCode < 300 THEN
+					bError:= FALSE;
+				END_IF
+			END_IF
+		END_IF
+		bBusy:= FALSE;
+		Q:= TRUE;
+	END_IF
+END_IF]]></ST>
+    </Implementation>
+  </POU>
+</TcPlcObject>

@@ -1,0 +1,94 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4026.12">
+  <POU Name="FB_StatusShellyPlus2PM" Id="{ff089260-f733-494d-8172-fbcefca6b4d8}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK FB_StatusShellyPlus2PM
+VAR_INPUT
+    bSend                : BOOL;
+END_VAR
+VAR_IN_OUT
+    fbClient             : FB_IotHttpClient;
+END_VAR
+VAR_OUTPUT
+    bBusy                : BOOL;
+    bError               : BOOL;
+    Q 					 : BOOL; // Falling edge of bBusy
+    nPercentage			 : UINT(0..100);
+END_VAR
+VAR
+    fbRequest            : FB_IotHttpRequest;
+    fbRisingEdgeSend     : R_TRIG;
+
+    {attribute 'TcEncoding':='UTF-8'}
+    sContent             : STRING(2047);
+
+    sComposedUri         : STRING(255);
+
+	// Variables for parsing JSON manually
+    pos                  : UDINT;
+    posCurrentPos        : UDINT;
+    currentPosVal        : DINT;
+    currentPosStr        : STRING(10);
+    i                    : INT;
+END_VAR
+
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[Q := FALSE;
+fbRisingEdgeSend(CLK:= bSend OR bBusy);
+
+IF NOT bBusy THEN
+    IF fbRisingEdgeSend.Q THEN
+		// curl "http://<IP>/rpc/Shelly.GetStatus"
+		sComposedUri := '/rpc/Shelly.GetStatus';
+
+        IF fbRequest.SendRequest(
+                sUri:=sComposedUri,
+                fbClient:=fbClient,
+                eRequestType:=ETcIotHttpRequestType.HTTP_GET,
+                pContent:=0,
+                nContentSize:=0,
+                0) THEN
+            bBusy:= TRUE;
+            bError:= FALSE;
+		ELSE
+			bError:=TRUE;
+			Q:= TRUE;
+        END_IF
+    END_IF
+ELSE
+    IF NOT fbRequest.bBusy THEN
+        bError:= TRUE;
+        IF NOT fbRequest.bError AND fbRequest.eErrorId = HTTP_REQ_ERR_SUCCESS  THEN
+            IF fbRequest.GetContent(pContent:= ADR(sContent), nContentSize:= SIZEOF(sContent), bSetNullTermination:= TRUE) THEN
+                IF fbRequest.nStatusCode >= 200 AND fbRequest.nStatusCode < 300 AND fbRequest.nContentSize > 0 THEN
+                    // Parse JSON manually using string operations (we could use the JSON PLC library but doing it manually is simple enough and avoids potential problems, e.g. with dynamic allocations)
+                    posCurrentPos := FIND2(ADR(sContent), ADR('"current_pos":'));
+                    IF posCurrentPos > 0 THEN
+						// Extract current_pos
+						pos := posCurrentPos + 14; // After '"current_pos":'
+						WHILE pos <= LEN2(ADR(sContent)) AND MID2(ADR(sContent), 1, pos) = ' ' DO
+							pos := pos + 1;
+						END_WHILE
+						currentPosStr := '';
+						WHILE pos <= LEN2(ADR(sContent)) AND MID2(ADR(sContent), 1, pos) >= '0' AND MID2(ADR(sContent), 1, pos) <= '9' DO
+							currentPosStr := CONCAT(currentPosStr, MID2(ADR(sContent), 1, pos));
+							pos := pos + 1;
+						END_WHILE
+						IF LEN(currentPosStr) > 0 THEN
+							currentPosVal := STRING_TO_DINT(currentPosStr);
+							IF currentPosVal >= 0 AND currentPosVal <= 100 THEN
+								nPercentage := DINT_TO_UINT(currentPosVal);
+							END_IF
+							bError := FALSE;
+						END_IF
+                    END_IF
+                END_IF
+            END_IF
+        END_IF
+        bBusy:= FALSE;
+        Q := TRUE;
+    END_IF
+END_IF]]></ST>
+    </Implementation>
+  </POU>
+</TcPlcObject>

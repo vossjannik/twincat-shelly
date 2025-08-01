@@ -1,0 +1,124 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4026.12">
+  <POU Name="FB_ShellyPlus2PM_CoverMode" Id="{8e8b59c2-a9cc-4346-a315-c9b4c69c1a37}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK FB_ShellyPlus2PM_CoverMode
+VAR_INPUT
+	{ attribute 'TcHmiSymbol.AddSymbol' }
+	nPercentage                      : UINT(0..100);
+	sHostname                        : STRING;
+END_VAR
+VAR_STAT
+	// One client for all shelly devices. HTTP clients are quite ressource intensive, so we share one instance.
+	fbHttpShellyClient               : FB_IotHttpClient := (bKeepAlive:=FALSE, tConnectionTimeout:=T#20S);
+	bHttpShellyClientBusy            : BOOL;
+	fbRandomNumberGenerator          : DRAND;
+END_VAR
+VAR
+	nNewestKnownActivePercentage     : UINT(0..100);
+	bGotInitialValue                 : BOOL;
+
+	fbCoverGoToPositionShellyPlus2PM : FB_CoverGoToPositionShellyPlus2PM;
+	fbStatusShellyPlus2PM            : FB_StatusShellyPlus2PM;
+
+	bReconfiguring                   : BOOL;
+
+	fbStatusIntervalTimer            : TON;
+	bStatusUpdateIsDue               : BOOL := TRUE;
+	fbPhaseOffsetTimer               : TON;
+	bPhaseOffsetDone                 : BOOL;
+	bInitialized                     : BOOL;
+END_VAR
+VAR CONSTANT
+	DELAYED_START                    : TIME := T#10S;   // Better safe than sorry; maybe the PLC is still connecting to the network 
+	GET_INTERVAL                     : TIME := T#300S;  // Fetch current state; helps if light is turned on/off in the philips hue app, or experienced a power outage
+	MAX_EXPECTED_LIGHTS              : UINT := 63;      // Current Philips Hue bridge limitation
+	MAX_PHASE_OFFSET                 : TIME := UDINT_TO_TIME(TIME_TO_UDINT(T#1S) * MAX_EXPECTED_LIGHTS); // Maximum offset to spread requests across most of the interval window
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[// Initialize phase offset based on light index (only once)
+IF NOT bInitialized THEN
+	// Calculate evenly distributed phase offset based on a random number.
+	// This ensures shelly device updates are spread evenly across the time window regardless of total count
+	fbRandomNumberGenerator();
+	fbPhaseOffsetTimer(IN := TRUE, PT := DELAYED_START + UDINT_TO_TIME(LREAL_TO_UDINT(fbRandomNumberGenerator.Num * UINT_TO_LREAL(MAX_EXPECTED_LIGHTS)) * TIME_TO_UDINT(MAX_PHASE_OFFSET) / MAX_EXPECTED_LIGHTS));
+	bInitialized := TRUE;
+END_IF
+
+// Handle phase offset - wait for the initial randomized delay before starting regular polling
+IF NOT bPhaseOffsetDone THEN
+	fbPhaseOffsetTimer();
+	IF fbPhaseOffsetTimer.Q THEN
+		bPhaseOffsetDone := TRUE;
+		fbPhaseOffsetTimer(IN := FALSE); // Reset the phase offset timer
+	END_IF
+END_IF
+
+IF bPhaseOffsetDone THEN
+	fbStatusIntervalTimer(IN := NOT fbStatusIntervalTimer.Q, PT:=GET_INTERVAL);
+	IF fbStatusIntervalTimer.Q THEN
+		bStatusUpdateIsDue := TRUE;
+	END_IF
+
+	IF NOT bHttpShellyClientBusy OR fbHttpShellyClient.sHostName = sHostname THEN
+		IF nNewestKnownActivePercentage <> nPercentage OR bStatusUpdateIsDue OR fbStatusShellyPlus2PM.bBusy OR fbCoverGoToPositionShellyPlus2PM.bBusy THEN
+			// we need to send something; lock the client resource for this FB instance
+			bHttpShellyClientBusy := TRUE;
+			
+			IF fbHttpShellyClient.sHostName <> sHostname THEN
+				fbHttpShellyClient.Disconnect();
+				bReconfiguring := TRUE;
+			END_IF
+			
+			IF bReconfiguring THEN
+				fbHttpShellyClient.Disconnect();
+				IF NOT fbHttpShellyClient.bConfigured THEN
+					fbHttpShellyClient.sHostName := sHostname;
+					bReconfiguring := FALSE;
+				END_IF
+			ELSE
+				IF fbHttpShellyClient.bConfigured THEN
+					// GoToPosition
+					fbCoverGoToPositionShellyPlus2PM(fbClient:=fbHttpShellyClient);
+					IF fbCoverGoToPositionShellyPlus2PM.Q THEN
+						IF fbCoverGoToPositionShellyPlus2PM.bError THEN
+						    // Reset after failed put
+							nPercentage := nNewestKnownActivePercentage;
+							fbCoverGoToPositionShellyPlus2PM.nPercentage := nNewestKnownActivePercentage;
+						ELSE
+							nNewestKnownActivePercentage := fbCoverGoToPositionShellyPlus2PM.nPercentage; // Adopt new value after successful request
+							
+							// Reset interval timer after successful PUT.
+							// This might be important, we don't want to get status updates while it is still moving.
+							// This changes the phase offset but the phase offset was random anyway.
+							fbStatusIntervalTimer(IN:=FALSE);
+						END_IF
+						bHttpShellyClientBusy := FALSE;
+					END_IF
+					fbCoverGoToPositionShellyPlus2PM.bSend := (fbCoverGoToPositionShellyPlus2PM.nPercentage <> nNewestKnownActivePercentage AND NOT fbStatusShellyPlus2PM.bBusy AND NOT bStatusUpdateIsDue);
+					IF NOT fbCoverGoToPositionShellyPlus2PM.bBusy THEN
+						fbCoverGoToPositionShellyPlus2PM.nPercentage := nPercentage;
+					END_IF
+
+					// Status
+					fbStatusShellyPlus2PM(fbClient:=fbHttpShellyClient);
+					IF fbStatusShellyPlus2PM.Q THEN
+						IF NOT fbStatusShellyPlus2PM.bError THEN
+							// Adopt percentage we got via the GET request
+							nNewestKnownActivePercentage := fbStatusShellyPlus2PM.nPercentage; 
+							nPercentage := fbStatusShellyPlus2PM.nPercentage;
+							bGotInitialValue := TRUE;
+						END_IF
+						bStatusUpdateIsDue := FALSE;
+						bHttpShellyClientBusy := FALSE;
+					END_IF
+					fbStatusShellyPlus2PM.bSend := (bStatusUpdateIsDue AND NOT fbCoverGoToPositionShellyPlus2PM.bBusy);
+				END_IF
+				fbHttpShellyClient.Execute();
+			END_IF
+		END_IF
+	END_IF
+END_IF]]></ST>
+    </Implementation>
+  </POU>
+</TcPlcObject>
